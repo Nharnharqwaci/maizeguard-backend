@@ -34,3 +34,32 @@ runs/
 # Build
 dist/
 build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Environment
+.env
+
+# Model files (too large for git)
+app/models/*.keras
+app/models/*.tflite
+app/models/*.pt
+app/models/*.h5
+
+# Uploaded images
+app/uploads/
+uploads/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

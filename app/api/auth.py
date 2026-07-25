@@ -5,6 +5,7 @@ from app.models.user import user_document
 from app.core.database import users_collection
 from app.core.security import hash_password, verify_password, create_access_token
 from bson import ObjectId
+from datetime import datetime
 
 router = APIRouter()
 
@@ -60,6 +61,7 @@ async def login(user: LoginRequest):
         "message": "Login successful",
         "access_token": token,
         "token_type": "bearer",
+        "user_id": str(db_user["_id"]),
         "role": db_user["role"],
         "full_name": db_user["full_name"]
     }

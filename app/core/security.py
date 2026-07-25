@@ -1,5 +1,5 @@
 import bcrypt
-from jose import jwt
+from jose import jwt, JWTError
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -17,6 +17,16 @@ def create_access_token(data: dict) -> str:
     payload = {**data, "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
+def decode_access_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM]
+        )
+        return payload
+    except JWTError:
+        return {}
 
 def hash_password(password: str) -> str:
     hashed = bcrypt.hashpw(

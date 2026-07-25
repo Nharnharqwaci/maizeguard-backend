@@ -6,10 +6,7 @@ import os
 load_dotenv(find_dotenv())
 
 MONGODB_URL = os.getenv("MONGODB_URL")
-print(
-    "Mongo URL:",
-    MONGODB_URL
-)
+
 DATABASE_NAME = os.getenv("DATABASE_NAME", "plantdb")
 
 if not MONGODB_URL:
