@@ -11,3 +11,4 @@ matplotlib
 opencv-python-headless
 supervision
 inference-sdk
+tensorflow-cpu==2.15.0
