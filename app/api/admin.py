@@ -35,12 +35,10 @@ async def get_analytics(admin=Depends(get_current_admin)):
     try:
         now = datetime.utcnow()
 
-        # User metrics
         total_users = await users_collection.count_documents({})
         total_farmers = await users_collection.count_documents({"role": "farmer"})
         total_admins = await users_collection.count_documents({"role": "admin"})
 
-        # New users today/this week/this month
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = now - timedelta(days=7)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -49,16 +47,13 @@ async def get_analytics(admin=Depends(get_current_admin)):
         new_users_week = await users_collection.count_documents({"created_at": {"$gte": week_start}})
         new_users_month = await users_collection.count_documents({"created_at": {"$gte": month_start}})
 
-        # Scan metrics
         total_scans = await scans_collection.count_documents({})
         scans_today = await scans_collection.count_documents({"created_at": {"$gte": today_start}})
         scans_week = await scans_collection.count_documents({"created_at": {"$gte": week_start}})
         scans_month = await scans_collection.count_documents({"created_at": {"$gte": month_start}})
 
-        # Average scans per user
         avg_scans = round(total_scans / total_users, 2) if total_users > 0 else 0
 
-        # Most active user — show Guest User if account was deleted / not found
         most_active_pipeline = [
             {"$group": {"_id": "$user_id", "scan_count": {"$sum": 1}}},
             {"$sort": {"scan_count": -1}},
@@ -73,7 +68,6 @@ async def get_analytics(admin=Depends(get_current_admin)):
                 "scan_count": doc["scan_count"]
             }
 
-        # Disease breakdown
         disease_pipeline = [
             {"$group": {"_id": "$prediction", "count": {"$sum": 1}}},
             {"$sort": {"count": -1}}
@@ -82,11 +76,9 @@ async def get_analytics(admin=Depends(get_current_admin)):
         async for doc in scans_collection.aggregate(disease_pipeline):
             disease_breakdown[doc["_id"]] = doc["count"]
 
-        # Healthy vs Disease ratio
         healthy_scans = disease_breakdown.get("Healthy", 0)
         disease_scans = total_scans - healthy_scans
 
-        # Language analytics
         lang_pipeline = [
             {"$match": {"lang": {"$exists": True, "$ne": None}}},
             {"$group": {"_id": "$lang", "count": {"$sum": 1}}},
@@ -99,7 +91,6 @@ async def get_analytics(admin=Depends(get_current_admin)):
         if not language_stats:
             language_stats = {}
 
-        # Monthly growth (users)
         last_6m = now - timedelta(days=180)
         monthly_users_pipeline = [
             {"$match": {"created_at": {"$gte": last_6m}}},
@@ -122,7 +113,6 @@ async def get_analytics(admin=Depends(get_current_admin)):
                 "count": doc["count"]
             })
 
-        # Monthly scan trends
         monthly_scans_pipeline = [
             {"$match": {"created_at": {"$gte": last_6m}}},
             {
@@ -144,7 +134,6 @@ async def get_analytics(admin=Depends(get_current_admin)):
                 "count": doc["count"]
             })
 
-        # Daily scan activity (last 30 days)
         last_30d = now - timedelta(days=30)
         daily_pipeline = [
             {"$match": {"created_at": {"$gte": last_30d}}},
@@ -492,3 +481,47 @@ async def get_user_scans(
     except Exception as e:
         logger.exception("Get user scans error")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/users/{user_id}/reset-password")
+async def admin_reset_password(
+    user_id: str,
+    admin=Depends(get_current_admin)
+):
+    """Admin generates a temporary password for a user."""
+    try:
+        import secrets
+        import string
+
+        def generate_temp_password(length: int = 10) -> str:
+            alphabet = string.ascii_letters + string.digits
+            return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+        user = await users_collection.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        temp_password = generate_temp_password()
+        hashed = hash_password(temp_password)
+
+        await users_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {
+                "password_hash": hashed,
+                "requires_password_change": True
+            }}
+        )
+
+        logger.info(f"Admin {admin['user_id']} reset password for user {user_id}")
+
+        return {
+            "message": f"Password reset for {user.get('full_name', 'User')}",
+            "temp_password": temp_password,
+            "phone_number": user.get("phone_number", ""),
+            "user_name": user.get("full_name", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Admin reset password error")
+        raise HTTPException(status_code=500, detail="Password reset failed")

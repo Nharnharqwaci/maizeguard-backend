@@ -1,25 +1,33 @@
+import logging
+import os
+import tempfile
+import base64
+import subprocess
+import asyncio
+import re
+from typing import Optional
+
+import aiohttp
 from fastapi import APIRouter, Header, Query, UploadFile, File
 from pydantic import BaseModel
-from typing import Optional
 from groq import Groq
 from datetime import datetime, timezone
 from bson import ObjectId
 from bson.errors import InvalidId
-import os
-import tempfile
-import requests
-import base64
-import subprocess
 
 from app.core.database import db
 from app.core.security import decode_access_token
+from app.services.mms_tts_service import mms_tts
+from app.services.mms_stt_service import mms_stt
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 chat_sessions = db["chat_sessions"]
 chat_messages = db["chat_messages"]
 
+# ── TRANSLATION SETUP ──
 GHANA_NLP_API_KEY = os.getenv("GHANA_NLP_API_KEY")
 KHAYA_BASE = "https://translation-api.ghananlp.org"
 
@@ -28,65 +36,144 @@ if GHANA_NLP_API_KEY:
     try:
         from ghana_nlp import GhanaNLP
         _nlp = GhanaNLP(api_key=GHANA_NLP_API_KEY)
-    except Exception:
+        logger.info("[Translation] GhanaNLP pip client initialized")
+    except Exception as e:
+        logger.warning(f"[Translation] Failed to init GhanaNLP pip client: {e}")
         _nlp = None
 
 
-def _translate_pip(text: str, pair: str) -> Optional[str]:
+# ── AGRICULTURAL TERM NORMALIZATION (fixes GhanaNLP domain gaps) ──
+AGRIC_TERM_MAP: dict[str, dict[str, str]] = {
+   "tw": {
+        "aburo": "maize",
+        "aburoo": "maize",
+        "aburoɔ": "maize",
+        "atoko": "millet",
+        "borɔdeɛ": "banana",
+        "anuanua": "pests",
+        "nkoae": "weeds",
+        "ɔgyefuo": "fertilizer",
+        "ntutu": "fertilizer",
+        "asase": "soil",
+        "nsuo": "water",
+        "yare": "disease",
+        "yareɛ": "disease",
+        "awu": "dead",
+        "kookoo": "cocoa",
+        "nkosua": "eggs",
+        "nam": "meat",
+    },
+    "dag": {
+        "kpaligu": "maize",
+        "kubiu": "water",
+        "nyɔŋ": "disease",
+        "kpakpuri": "fertilizer",
+        "tihi": "pests",
+        "nyɔŋa": "disease",
+    },
+}
+
+_EN_TO_LOCAL: dict[str, dict[str, str]] = {
+    lang: {v: k for k, v in pairs.items()}
+    for lang, pairs in AGRIC_TERM_MAP.items()
+}
+
+
+def _normalize_terms(text: str, lang: str) -> str:
+    """Replace local ag terms with English before translation."""
+    if lang not in AGRIC_TERM_MAP or not text:
+        return text
+    for local_term, english_term in AGRIC_TERM_MAP[lang].items():
+        pattern = re.compile(re.escape(local_term), re.IGNORECASE)
+        text = pattern.sub(english_term, text)
+    return text
+
+
+def _localize_terms(text: str, lang: str) -> str:
+    """Replace English ag terms with local terms after translation."""
+    if lang not in _EN_TO_LOCAL or not text:
+        return text
+    for english_term, local_term in _EN_TO_LOCAL[lang].items():
+        pattern = re.compile(r"\b" + re.escape(english_term) + r"\b", re.IGNORECASE)
+        text = pattern.sub(local_term, text)
+    return text
+
+
+# ── Async translation helpers ──
+async def _translate_pip(text: str, pair: str) -> Optional[str]:
     if not _nlp or not text:
         return None
     try:
-        return _nlp.translate(text, language_pair=pair)
-    except Exception:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _nlp.translate(text, language_pair=pair))
+        if result and result != text:
+            return result
+        return None
+    except Exception as e:
+        logger.warning(f"[Translation] pip failed for {pair}: {e}")
         return None
 
 
-def _translate_rest(text: str, pair: str) -> Optional[str]:
+async def _translate_rest(text: str, pair: str) -> Optional[str]:
     if not GHANA_NLP_API_KEY or not text:
         return None
     try:
-        parts = pair.split("-")
-        if len(parts) != 2:
-            return None
-        source, target = parts
-        r = requests.post(
-            f"{KHAYA_BASE}/v1/translate",
-            headers={
-                "Authorization": f"Bearer {GHANA_NLP_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"text": text, "source": source, "target": target},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data.get("translated_text") or data.get("translation") or data.get("result")
-    except Exception:
+        source, target = pair.split("-")
+    except ValueError:
+        return None
+
+    url = f"{KHAYA_BASE}/v1/translate"
+    payload = {"text": text, "source": source, "target": target}
+    headers = {
+        "Authorization": f"Bearer {GHANA_NLP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"[Translation] REST returned {r.status} for {pair}: {body[:200]}")
+                    return None
+                data = await r.json()
+                result = data.get("translated_text") or data.get("translation") or data.get("result")
+                if result and result != text:
+                    return result
+                return None
+    except asyncio.TimeoutError:
+        logger.warning(f"[Translation] REST timeout for {pair}")
+        return None
+    except Exception as e:
+        logger.warning(f"[Translation] REST failed for {pair}: {e}")
         return None
 
 
-def translate(text: str, pair: str) -> Optional[str]:
-    result = _translate_pip(text, pair)
+async def translate(text: str, pair: str) -> Optional[str]:
+    result = await _translate_pip(text, pair)
     if result and result != text:
         return result
-    result = _translate_rest(text, pair)
+    result = await _translate_rest(text, pair)
     if result and result != text:
         return result
     return None
 
 
-def translate_to_english(text: str, source_lang: str) -> str:
+async def translate_to_english(text: str, source_lang: str) -> str:
     if source_lang == "en" or not text or not text.strip():
         return text
-    result = translate(text, f"{source_lang}-en")
-    return result if result else text
+    normalized = _normalize_terms(text, source_lang)
+    result = await translate(normalized, f"{source_lang}-en")
+    return result if result else normalized
 
 
-def translate_from_english(text: str, target_lang: str) -> str:
+async def translate_from_english(text: str, target_lang: str) -> str:
     if target_lang == "en" or not text or not text.strip():
         return text
-    result = translate(text, f"en-{target_lang}")
-    return result if result else text
+    result = await translate(text, f"en-{target_lang}")
+    if result:
+        return _localize_terms(result, target_lang)
+    return text
 
 
 # ── Audio conversion: webm -> wav ──
@@ -101,69 +188,77 @@ def convert_webm_to_wav(webm_path: str) -> Optional[str]:
             timeout=10,
         )
         return wav_path
-    except Exception:
+    except Exception as e:
+        logger.error(f"[Audio] ffmpeg failed: {e}")
         return None
 
 
-# ── STT via Khaya AI REST API ──
-def _khaya_stt(audio_path: str, lang: str) -> Optional[str]:
+# ── STT: Meta MMS (Twi + English) → Khaya AI (Dagbani fallback) ──
+async def _khaya_stt(audio_path: str, lang: str) -> Optional[str]:
     if not GHANA_NLP_API_KEY:
         return None
     try:
-        with open(audio_path, "rb") as f:
-            files = {"audio": (os.path.basename(audio_path), f, "audio/wav")}
-            data = {"language": lang}
-            headers = {"Authorization": f"Bearer {GHANA_NLP_API_KEY}"}
-            r = requests.post(
-                f"{KHAYA_BASE}/v1/asr",
-                files=files,
-                data=data,
-                headers=headers,
-                timeout=30,
-            )
-            r.raise_for_status()
-            result = r.json().get("text") or r.json().get("transcript") or r.json().get("result")
-            return result
-    except Exception:
+        async with aiohttp.ClientSession() as session:
+            with open(audio_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("audio", f, filename=os.path.basename(audio_path), content_type="audio/wav")
+                data.add_field("language", lang)
+                async with session.post(
+                    f"{KHAYA_BASE}/v1/asr",
+                    data=data,
+                    headers={"Authorization": f"Bearer {GHANA_NLP_API_KEY}"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        logger.warning(f"[STT] Khaya returned {r.status}: {body[:200]}")
+                        return None
+                    result_data = await r.json()
+                    return result_data.get("text") or result_data.get("transcript") or result_data.get("result")
+    except Exception as e:
+        logger.warning(f"[STT] Khaya fallback failed: {e}")
         return None
 
 
-def _ghana_nlp_stt(audio_path: str, lang: str) -> Optional[str]:
+async def _ghana_nlp_stt(audio_path: str, lang: str) -> Optional[str]:
     if not _nlp:
         return None
     try:
-        # Try different possible method names
+        loop = asyncio.get_event_loop()
         if hasattr(_nlp, "speech_to_text"):
-            return _nlp.speech_to_text(audio_path, language=lang)
+            return await loop.run_in_executor(None, lambda: _nlp.speech_to_text(audio_path, language=lang))
         elif hasattr(_nlp, "stt"):
-            return _nlp.stt(audio_path, language=lang)
+            return await loop.run_in_executor(None, lambda: _nlp.stt(audio_path, language=lang))
         elif hasattr(_nlp, "transcribe"):
-            return _nlp.transcribe(audio_path, language=lang)
+            return await loop.run_in_executor(None, lambda: _nlp.transcribe(audio_path, language=lang))
         return None
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[STT] GhanaNLP pip STT failed: {e}")
         return None
 
 
 async def speech_to_text(audio_bytes: bytes, lang: str) -> str:
-    # Save uploaded audio
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
         tmp.write(audio_bytes)
         webm_path = tmp.name
 
     try:
-        # Convert webm -> wav (Khaya ASR needs wav)
         wav_path = convert_webm_to_wav(webm_path)
         if not wav_path or not os.path.exists(wav_path):
-            # Fallback: try with raw webm
             wav_path = webm_path
 
-        # Try Khaya REST API first
-        text = _khaya_stt(wav_path, lang)
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, mms_stt.transcribe, wav_path, lang)
+        if text:
+            logger.info(f"[STT] MMS succeeded: {text[:80]}")
+            return text
+        logger.info(f"[STT] MMS returned empty for {lang}, trying Khaya fallback...")
+
+        text = await _khaya_stt(wav_path, lang)
         if text:
             return text
 
-        # Fallback to pip package
-        text = _ghana_nlp_stt(wav_path, lang)
+        text = await _ghana_nlp_stt(wav_path, lang)
         if text:
             return text
 
@@ -177,37 +272,51 @@ async def speech_to_text(audio_bytes: bytes, lang: str) -> str:
                 pass
 
 
-# ── TTS via Khaya AI REST API ──
-def _khaya_tts(text: str, lang: str) -> Optional[bytes]:
+# ── TTS: Meta MMS (Twi, English) → Khaya AI (Dagbani fallback) ──
+async def _khaya_tts(text: str, lang: str) -> Optional[bytes]:
     if not GHANA_NLP_API_KEY:
         return None
     try:
-        headers = {
-            "Authorization": f"Bearer {GHANA_NLP_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        r = requests.post(
-            f"{KHAYA_BASE}/v1/tts",
-            headers=headers,
-            json={"text": text, "language": lang},
-            timeout=30,
-        )
-        r.raise_for_status()
-        # Response might be raw audio bytes or base64 JSON
-        content_type = r.headers.get("Content-Type", "")
-        if "json" in content_type:
-            data = r.json()
-            audio_b64 = data.get("audio") or data.get("audio_base64") or data.get("result")
-            if audio_b64:
-                return base64.b64decode(audio_b64)
-            return None
-        return r.content
-    except Exception:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{KHAYA_BASE}/v1/tts",
+                headers={
+                    "Authorization": f"Bearer {GHANA_NLP_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"text": text, "language": lang},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"[TTS] Khaya returned {r.status}: {body[:200]}")
+                    return None
+                content_type = r.headers.get("Content-Type", "")
+                if "json" in content_type:
+                    data = await r.json()
+                    audio_b64 = data.get("audio") or data.get("audio_base64") or data.get("result")
+                    if audio_b64:
+                        return base64.b64decode(audio_b64)
+                    return None
+                return await r.read()
+    except Exception as e:
+        logger.warning(f"[TTS] Khaya fallback failed: {e}")
         return None
 
 
-def text_to_speech(text: str, lang: str) -> Optional[bytes]:
-    return _khaya_tts(text, lang)
+async def text_to_speech(text: str, lang: str) -> Optional[bytes]:
+    loop = asyncio.get_event_loop()
+    audio = await loop.run_in_executor(None, mms_tts.synthesize, text, lang)
+    if audio:
+        return audio
+
+    if lang in ("dag",):
+        logger.info(f"[TTS] MMS doesn't support {lang}, trying Khaya AI TTS...")
+        audio = await _khaya_tts(text, lang)
+        if audio:
+            return audio
+
+    return None
 
 
 DISEASE_CONTEXT: dict[str, str] = {
@@ -359,7 +468,9 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
     lang = request.language if request.language in ("en", "tw", "dag") else "en"
 
     try:
-        english_input = translate_to_english(request.message, lang)
+        english_input = await translate_to_english(request.message, lang)
+        logger.info(f"[Chat] lang={lang} translated_input_preview={english_input[:80]!r}")
+
         session = None
         session_id: Optional[str] = None
 
@@ -404,7 +515,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
         else:
             history = []
             for m in request.history:
-                en_content = translate_to_english(m.content, lang) if lang != "en" else m.content
+                en_content = await translate_to_english(m.content, lang) if lang != "en" else m.content
                 history.append({"role": m.role, "content": en_content})
 
         history.append({"role": "user", "content": english_input})
@@ -425,7 +536,8 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
         )
 
         english_reply = response.choices[0].message.content
-        display_reply = translate_from_english(english_reply, lang)
+        display_reply = await translate_from_english(english_reply, lang)
+        logger.info(f"[Chat] lang={lang} translated_reply_preview={display_reply[:80]!r}")
 
         if user_id and session_id:
             now = datetime.now(timezone.utc)
@@ -454,7 +566,8 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
         return {"reply": display_reply, "session_id": session_id, "language": lang}
 
-    except Exception:
+    except Exception as e:
+        logger.exception(f"[CHAT ERROR] lang={lang} msg_preview={request.message[:60]!r} error={e}")
         fallback = (
             "I'm sorry, I'm having trouble responding right now. Please try again in a moment."
             if lang == "en"
@@ -477,10 +590,19 @@ async def stt_endpoint(
 
 @router.post("/chat/tts")
 async def tts_endpoint(request: TTSRequest):
-    audio = text_to_speech(request.text, request.language)
+    audio = await text_to_speech(request.text, request.language)
     if audio is None:
         return {"audio": None, "error": "TTS unavailable"}
     return {"audio": base64.b64encode(audio).decode("utf-8"), "language": request.language}
+
+
+@router.get("/chat/tts-health")
+async def tts_health():
+    return {
+        "tts": mms_tts.health(),
+        "stt": mms_stt.health(),
+        "ghana_nlp_key_set": bool(GHANA_NLP_API_KEY),
+    }
 
 
 @router.get("/chat/sessions")
