@@ -47,12 +47,6 @@ env/
 # Environment
 .env
 
-# Model files (too large for git)
-app/models/*.keras
-app/models/*.tflite
-app/models/*.pt
-app/models/*.h5
-
 # Uploaded images
 app/uploads/
 uploads/
