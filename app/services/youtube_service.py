@@ -110,10 +110,7 @@ FALLBACK_VIDEOS: Dict[str, List[Dict]] = {
             "url": "https://www.youtube.com/watch?v=NiBXpz_RWo4",
         },
     ],
-    "Uncertain": [
-        {
-        },
-    ],
+    "Uncertain": [],
 }
 
 SEARCHES = {
