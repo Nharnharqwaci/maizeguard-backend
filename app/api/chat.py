@@ -17,8 +17,6 @@ from bson.errors import InvalidId
 
 from app.core.database import db
 from app.core.security import decode_access_token
-from app.services.mms_tts_service import mms_tts
-from app.services.mms_stt_service import mms_stt
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -26,6 +24,48 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 chat_sessions = db["chat_sessions"]
 chat_messages = db["chat_messages"]
+
+# ── RENDER / PRODUCTION GUARDRAILS ──
+# Meta MMS models need ~3 GB RAM (STT base alone is 2.5 GB).
+# Render free tier = 512 MB. Set DISABLE_MMS=true on low-RAM hosts.
+DISABLE_MMS = os.getenv("DISABLE_MMS", "false").lower() in ("true", "1", "yes")
+
+# ── LAZY MMS LOADERS (prevents import-time crashes on Render) ──
+_mms_tts_instance = None
+_mms_stt_instance = None
+
+
+def _get_mms_tts():
+    """Lazy-load MMS TTS. Returns None if unavailable or disabled."""
+    global _mms_tts_instance
+    if DISABLE_MMS:
+        return None
+    if _mms_tts_instance is None:
+        try:
+            from app.services.mms_tts_service import mms_tts
+            _mms_tts_instance = mms_tts
+            logger.info("[MMS] TTS module loaded")
+        except Exception as e:
+            logger.warning(f"[MMS] TTS import/instantiation failed: {e}")
+            _mms_tts_instance = False
+    return _mms_tts_instance if _mms_tts_instance is not False else None
+
+
+def _get_mms_stt():
+    """Lazy-load MMS STT. Returns None if unavailable or disabled."""
+    global _mms_stt_instance
+    if DISABLE_MMS:
+        return None
+    if _mms_stt_instance is None:
+        try:
+            from app.services.mms_stt_service import mms_stt
+            _mms_stt_instance = mms_stt
+            logger.info("[MMS] STT module loaded")
+        except Exception as e:
+            logger.warning(f"[MMS] STT import/instantiation failed: {e}")
+            _mms_stt_instance = False
+    return _mms_stt_instance if _mms_stt_instance is not False else None
+
 
 # ── TRANSLATION SETUP ──
 GHANA_NLP_API_KEY = os.getenv("GHANA_NLP_API_KEY")
@@ -42,9 +82,9 @@ if GHANA_NLP_API_KEY:
         _nlp = None
 
 
-# ── AGRICULTURAL TERM NORMALIZATION (fixes GhanaNLP domain gaps) ──
+# ── AGRICULTURAL TERM NORMALIZATION ──
 AGRIC_TERM_MAP: dict[str, dict[str, str]] = {
-   "tw": {
+    "tw": {
         "aburo": "maize",
         "aburoo": "maize",
         "aburoɔ": "maize",
@@ -116,6 +156,7 @@ async def _translate_pip(text: str, pair: str) -> Optional[str]:
 
 async def _translate_rest(text: str, pair: str) -> Optional[str]:
     if not GHANA_NLP_API_KEY or not text:
+        logger.warning(f"[Translation] REST skipped — no GHANA_NLP_API_KEY or empty text (pair={pair})")
         return None
     try:
         source, target = pair.split("-")
@@ -131,7 +172,9 @@ async def _translate_rest(text: str, pair: str) -> Optional[str]:
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            async with session.post(
+                url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
                 if r.status != 200:
                     body = await r.text()
                     logger.warning(f"[Translation] REST returned {r.status} for {pair}: {body[:200]}")
@@ -150,12 +193,18 @@ async def _translate_rest(text: str, pair: str) -> Optional[str]:
 
 
 async def translate(text: str, pair: str) -> Optional[str]:
+    logger.info(f"[Translation] Attempting {pair} | text='{text[:80]}...'")
     result = await _translate_pip(text, pair)
     if result and result != text:
+        logger.info(f"[Translation] pip success for {pair}")
         return result
+
     result = await _translate_rest(text, pair)
     if result and result != text:
+        logger.info(f"[Translation] REST success for {pair}")
         return result
+
+    logger.error(f"[Translation] ALL methods failed for {pair}. Returning None.")
     return None
 
 
@@ -172,8 +221,10 @@ async def translate_from_english(text: str, target_lang: str) -> str:
         return text
     result = await translate(text, f"en-{target_lang}")
     if result:
-        return _localize_terms(result, target_lang)
-    return text
+        localized = _localize_terms(result, target_lang)
+        return localized
+    logger.error(f"[Translation] CRITICAL: Could not translate reply to {target_lang}")
+    return text  # fallback to English so user at least sees something
 
 
 # ── Audio conversion: webm -> wav ──
@@ -193,7 +244,7 @@ def convert_webm_to_wav(webm_path: str) -> Optional[str]:
         return None
 
 
-# ── STT: Meta MMS (Twi + English) → Khaya AI (Dagbani fallback) ──
+# ── STT: Meta MMS (lazy) → Khaya AI → GhanaNLP pip ──
 async def _khaya_stt(audio_path: str, lang: str) -> Optional[str]:
     if not GHANA_NLP_API_KEY:
         return None
@@ -247,13 +298,20 @@ async def speech_to_text(audio_bytes: bytes, lang: str) -> str:
         if not wav_path or not os.path.exists(wav_path):
             wav_path = webm_path
 
-        loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, mms_stt.transcribe, wav_path, lang)
-        if text:
-            logger.info(f"[STT] MMS succeeded: {text[:80]}")
-            return text
-        logger.info(f"[STT] MMS returned empty for {lang}, trying Khaya fallback...")
+        # Try lazy-loaded MMS first
+        mms = _get_mms_stt()
+        if mms:
+            try:
+                loop = asyncio.get_event_loop()
+                text = await loop.run_in_executor(None, mms.transcribe, wav_path, lang)
+                if text:
+                    logger.info(f"[STT] MMS succeeded: {text[:80]}")
+                    return text
+                logger.info(f"[STT] MMS returned empty for {lang}, trying Khaya fallback...")
+            except Exception as e:
+                logger.warning(f"[STT] MMS failed: {e}")
 
+        # Fallbacks
         text = await _khaya_stt(wav_path, lang)
         if text:
             return text
@@ -272,7 +330,7 @@ async def speech_to_text(audio_bytes: bytes, lang: str) -> str:
                 pass
 
 
-# ── TTS: Meta MMS (Twi, English) → Khaya AI (Dagbani fallback) ──
+# ── TTS: Meta MMS (lazy) → Khaya AI ──
 async def _khaya_tts(text: str, lang: str) -> Optional[bytes]:
     if not GHANA_NLP_API_KEY:
         return None
@@ -305,20 +363,27 @@ async def _khaya_tts(text: str, lang: str) -> Optional[bytes]:
 
 
 async def text_to_speech(text: str, lang: str) -> Optional[bytes]:
-    loop = asyncio.get_event_loop()
-    audio = await loop.run_in_executor(None, mms_tts.synthesize, text, lang)
+    # Try lazy-loaded MMS first
+    mms = _get_mms_tts()
+    if mms:
+        try:
+            loop = asyncio.get_event_loop()
+            audio = await loop.run_in_executor(None, mms.synthesize, text, lang)
+            if audio:
+                return audio
+        except Exception as e:
+            logger.warning(f"[TTS] MMS synthesis failed: {e}")
+
+    # Fallback to Khaya for ALL languages (not just dag)
+    logger.info(f"[TTS] MMS unavailable or failed, trying Khaya AI for {lang}...")
+    audio = await _khaya_tts(text, lang)
     if audio:
         return audio
-
-    if lang in ("dag",):
-        logger.info(f"[TTS] MMS doesn't support {lang}, trying Khaya AI TTS...")
-        audio = await _khaya_tts(text, lang)
-        if audio:
-            return audio
 
     return None
 
 
+# ── DISEASE CONTEXT ──
 DISEASE_CONTEXT: dict[str, str] = {
     "Common_Rust": """The farmer's maize leaf has been diagnosed with Common Rust (Puccinia sorghi).
 Common Rust is a fungal disease causing orange-red pustules on both leaf surfaces.
@@ -537,7 +602,11 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
         english_reply = response.choices[0].message.content
         display_reply = await translate_from_english(english_reply, lang)
-        logger.info(f"[Chat] lang={lang} translated_reply_preview={display_reply[:80]!r}")
+        
+        if display_reply == english_reply and lang != "en":
+            logger.error(f"[Chat] CRITICAL: Translation to {lang} failed. Returning English fallback.")
+        else:
+            logger.info(f"[Chat] lang={lang} translated_reply_preview={display_reply[:80]!r}")
 
         if user_id and session_id:
             now = datetime.now(timezone.utc)
@@ -598,10 +667,13 @@ async def tts_endpoint(request: TTSRequest):
 
 @router.get("/chat/tts-health")
 async def tts_health():
+    mms_tts_loaded = _get_mms_tts()
+    mms_stt_loaded = _get_mms_stt()
     return {
-        "tts": mms_tts.health(),
-        "stt": mms_stt.health(),
+        "mms_tts": mms_tts_loaded.health() if mms_tts_loaded else {"available": False, "reason": "not_loaded_or_disabled"},
+        "mms_stt": mms_stt_loaded.health() if mms_stt_loaded else {"available": False, "reason": "not_loaded_or_disabled"},
         "ghana_nlp_key_set": bool(GHANA_NLP_API_KEY),
+        "ghana_nlp_pip_loaded": _nlp is not None,
     }
 
 

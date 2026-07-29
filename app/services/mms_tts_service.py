@@ -17,8 +17,7 @@ except ImportError as e:
 # Only languages with confirmed HuggingFace models
 MMS_LANG_MAP = {
     "en": "eng",
-    "tw": "aka",   # Akan = Twi
-    # "dag" intentionally omitted — facebook/mms-tts-dag does not exist
+    "tw": "aka",
 }
 
 MMS_UNSUPPORTED = {"dag"}
@@ -35,12 +34,13 @@ class MMSTTSService:
         logger.info(f"[MMS-TTS] Init. Available={_MMS_AVAILABLE}, Device={self._device}")
 
     def preload(self, lang_codes: Optional[list[str]] = None):
+        """Pre-load models into memory. Call this at startup if you have enough RAM."""
         if not _MMS_AVAILABLE:
             logger.error("[MMS-TTS] Cannot preload — torch/transformers not installed")
             return
         for code in (lang_codes or list(MMS_LANG_MAP.keys())):
             if code in MMS_UNSUPPORTED:
-                logger.info(f"[MMS-TTS] Skipping {code} — no MMS model exists. Will use browser fallback.")
+                logger.info(f"[MMS-TTS] Skipping {code} — no MMS model exists. Will use Khaya fallback.")
                 continue
             self._load_model(code)
 
@@ -78,7 +78,7 @@ class MMSTTSService:
             logger.warning("[MMS-TTS] Empty text received")
             return None
         if lang_code in MMS_UNSUPPORTED:
-            logger.info(f"[MMS-TTS] {lang_code} not supported by MMS — returning None for browser fallback")
+            logger.info(f"[MMS-TTS] {lang_code} not supported by MMS — returning None for Khaya fallback")
             return None
 
         loaded = self._load_model(lang_code)
@@ -127,4 +127,5 @@ class MMSTTSService:
         }
 
 
+# Singleton instance — imported lazily by chat.py
 mms_tts = MMSTTSService()

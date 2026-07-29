@@ -1,7 +1,5 @@
 # app/services/mms_stt_service.py
 import logging
-import os
-import tempfile
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -40,6 +38,7 @@ class MMSSTTService:
         logger.info(f"[MMS-STT] Init. Available={_MMS_STT_AVAILABLE}, Device={self._device}")
 
     def preload(self, lang_codes: Optional[list[str]] = None):
+        """Pre-load base model + adapters. Call this at startup if you have enough RAM (~3 GB)."""
         if not _MMS_STT_AVAILABLE:
             logger.error("[MMS-STT] Cannot preload — dependencies missing")
             return
@@ -146,4 +145,5 @@ class MMSSTTService:
         }
 
 
+# Singleton instance — imported lazily by chat.py
 mms_stt = MMSSTTService()
