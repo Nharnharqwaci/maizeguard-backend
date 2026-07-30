@@ -145,5 +145,5 @@ class MMSSTTService:
         }
 
 
-# Singleton instance — imported lazily by chat.py
+# 
 mms_stt = MMSSTTService()

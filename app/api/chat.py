@@ -26,17 +26,14 @@ chat_sessions = db["chat_sessions"]
 chat_messages = db["chat_messages"]
 
 # ── RENDER / PRODUCTION GUARDRAILS ──
-# Meta MMS models need ~3 GB RAM (STT base alone is 2.5 GB).
-# Render free tier = 512 MB. Set DISABLE_MMS=true on low-RAM hosts.
 DISABLE_MMS = os.getenv("DISABLE_MMS", "false").lower() in ("true", "1", "yes")
 
-# ── LAZY MMS LOADERS (prevents import-time crashes on Render) ──
+# ── LAZY MMS LOADERS ──
 _mms_tts_instance = None
 _mms_stt_instance = None
 
 
 def _get_mms_tts():
-    """Lazy-load MMS TTS. Returns None if unavailable or disabled."""
     global _mms_tts_instance
     if DISABLE_MMS:
         return None
@@ -52,7 +49,6 @@ def _get_mms_tts():
 
 
 def _get_mms_stt():
-    """Lazy-load MMS STT. Returns None if unavailable or disabled."""
     global _mms_stt_instance
     if DISABLE_MMS:
         return None
@@ -120,7 +116,6 @@ _EN_TO_LOCAL: dict[str, dict[str, str]] = {
 
 
 def _normalize_terms(text: str, lang: str) -> str:
-    """Replace local ag terms with English before translation."""
     if lang not in AGRIC_TERM_MAP or not text:
         return text
     for local_term, english_term in AGRIC_TERM_MAP[lang].items():
@@ -130,7 +125,6 @@ def _normalize_terms(text: str, lang: str) -> str:
 
 
 def _localize_terms(text: str, lang: str) -> str:
-    """Replace English ag terms with local terms after translation."""
     if lang not in _EN_TO_LOCAL or not text:
         return text
     for english_term, local_term in _EN_TO_LOCAL[lang].items():
@@ -146,7 +140,17 @@ async def _translate_pip(text: str, pair: str) -> Optional[str]:
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: _nlp.translate(text, language_pair=pair))
-        if result and result != text:
+
+        # FIX: ghana-nlp sometimes returns a dict instead of a string
+        if isinstance(result, dict):
+            result = (
+                result.get("translation")
+                or result.get("translated_text")
+                or result.get("result")
+                or result.get("text")
+            )
+
+        if isinstance(result, str) and result and result != text:
             return result
         return None
     except Exception as e:
@@ -195,12 +199,12 @@ async def _translate_rest(text: str, pair: str) -> Optional[str]:
 async def translate(text: str, pair: str) -> Optional[str]:
     logger.info(f"[Translation] Attempting {pair} | text='{text[:80]}...'")
     result = await _translate_pip(text, pair)
-    if result and result != text:
+    if result:
         logger.info(f"[Translation] pip success for {pair}")
         return result
 
     result = await _translate_rest(text, pair)
-    if result and result != text:
+    if result:
         logger.info(f"[Translation] REST success for {pair}")
         return result
 
@@ -213,18 +217,18 @@ async def translate_to_english(text: str, source_lang: str) -> str:
         return text
     normalized = _normalize_terms(text, source_lang)
     result = await translate(normalized, f"{source_lang}-en")
-    return result if result else normalized
+    return result if isinstance(result, str) else normalized
 
 
 async def translate_from_english(text: str, target_lang: str) -> str:
     if target_lang == "en" or not text or not text.strip():
         return text
     result = await translate(text, f"en-{target_lang}")
-    if result:
+    if isinstance(result, str):
         localized = _localize_terms(result, target_lang)
         return localized
     logger.error(f"[Translation] CRITICAL: Could not translate reply to {target_lang}")
-    return text  # fallback to English so user at least sees something
+    return text
 
 
 # ── Audio conversion: webm -> wav ──
@@ -379,16 +383,18 @@ async def text_to_speech(text: str, lang: str) -> Optional[bytes]:
             logger.warning(f"[TTS] MMS synthesis failed: {e}")
 
     # 2. Try GhanaNLP pip client
+    # FIX: ghana-nlp TTS methods use 'lang=' NOT 'language='
     if _nlp:
         try:
             loop = asyncio.get_event_loop()
             audio = None
+
             if hasattr(_nlp, "text_to_speech"):
-                audio = await loop.run_in_executor(None, lambda: _nlp.text_to_speech(text, language=lang))
+                audio = await loop.run_in_executor(None, lambda: _nlp.text_to_speech(text, lang=lang))
             elif hasattr(_nlp, "tts"):
-                audio = await loop.run_in_executor(None, lambda: _nlp.tts(text, language=lang))
+                audio = await loop.run_in_executor(None, lambda: _nlp.tts(text, lang=lang))
             elif hasattr(_nlp, "synthesize"):
-                audio = await loop.run_in_executor(None, lambda: _nlp.synthesize(text, language=lang))
+                audio = await loop.run_in_executor(None, lambda: _nlp.synthesize(text, lang=lang))
 
             if audio:
                 if isinstance(audio, bytes):
@@ -565,7 +571,8 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
     try:
         english_input = await translate_to_english(request.message, lang)
-        logger.info(f"[Chat] lang={lang} translated_input_preview={english_input[:80]!r}")
+        # FIX: safe string conversion for logging
+        logger.info(f"[Chat] lang={lang} translated_input_preview={str(english_input)[:80]!r}")
 
         session = None
         session_id: Optional[str] = None
@@ -637,7 +644,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
         if display_reply == english_reply and lang != "en":
             logger.error(f"[Chat] CRITICAL: Translation to {lang} failed. Returning English fallback.")
         else:
-            logger.info(f"[Chat] lang={lang} translated_reply_preview={display_reply[:80]!r}")
+            logger.info(f"[Chat] lang={lang} translated_reply_preview={str(display_reply)[:80]!r}")
 
         if user_id and session_id:
             now = datetime.now(timezone.utc)
@@ -646,7 +653,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                     "session_id": session_id,
                     "user_id": user_id,
                     "role": "user",
-                    "content_en": english_input,
+                    "content_en": english_input if isinstance(english_input, str) else request.message,
                     "content_display": request.message,
                     "timestamp": now,
                 },
