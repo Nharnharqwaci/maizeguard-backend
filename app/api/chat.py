@@ -244,7 +244,7 @@ def convert_webm_to_wav(webm_path: str) -> Optional[str]:
         return None
 
 
-# ── STT: Meta MMS (lazy) → Khaya AI → GhanaNLP pip ──
+# ── STT: Meta MMS (lazy) → GhanaNLP pip → Khaya REST ──
 async def _khaya_stt(audio_path: str, lang: str) -> Optional[str]:
     if not GHANA_NLP_API_KEY:
         return None
@@ -257,7 +257,7 @@ async def _khaya_stt(audio_path: str, lang: str) -> Optional[str]:
                 async with session.post(
                     f"{KHAYA_BASE}/v1/asr",
                     data=data,
-                    headers={"Authorization": f"Bearer {GHANA_NLP_API_KEY}"},
+                    headers={"Ocp-Apim-Subscription-Key": GHANA_NLP_API_KEY},
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as r:
                     if r.status != 200:
@@ -298,7 +298,7 @@ async def speech_to_text(audio_bytes: bytes, lang: str) -> str:
         if not wav_path or not os.path.exists(wav_path):
             wav_path = webm_path
 
-        # Try lazy-loaded MMS first
+        # 1. Try lazy-loaded MMS first
         mms = _get_mms_stt()
         if mms:
             try:
@@ -307,17 +307,20 @@ async def speech_to_text(audio_bytes: bytes, lang: str) -> str:
                 if text:
                     logger.info(f"[STT] MMS succeeded: {text[:80]}")
                     return text
-                logger.info(f"[STT] MMS returned empty for {lang}, trying Khaya fallback...")
+                logger.info(f"[STT] MMS returned empty for {lang}, trying next fallback...")
             except Exception as e:
                 logger.warning(f"[STT] MMS failed: {e}")
 
-        # Fallbacks
-        text = await _khaya_stt(wav_path, lang)
-        if text:
-            return text
-
+        # 2. Try GhanaNLP pip client
         text = await _ghana_nlp_stt(wav_path, lang)
         if text:
+            logger.info(f"[STT] GhanaNLP pip success: {text[:80]}")
+            return text
+
+        # 3. Fallback to Khaya REST
+        text = await _khaya_stt(wav_path, lang)
+        if text:
+            logger.info(f"[STT] Khaya REST success: {text[:80]}")
             return text
 
         return ""
@@ -330,7 +333,7 @@ async def speech_to_text(audio_bytes: bytes, lang: str) -> str:
                 pass
 
 
-# ── TTS: Meta MMS (lazy) → Khaya AI ──
+# ── TTS: Meta MMS (lazy) → GhanaNLP pip → Khaya REST ──
 async def _khaya_tts(text: str, lang: str) -> Optional[bytes]:
     if not GHANA_NLP_API_KEY:
         return None
@@ -339,10 +342,10 @@ async def _khaya_tts(text: str, lang: str) -> Optional[bytes]:
             async with session.post(
                 f"{KHAYA_BASE}/v1/tts",
                 headers={
-                    "Authorization": f"Bearer {GHANA_NLP_API_KEY}",
                     "Content-Type": "application/json",
+                    "Ocp-Apim-Subscription-Key": GHANA_NLP_API_KEY,
                 },
-                json={"text": text, "language": lang},
+                json={"in": text, "lang": lang},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as r:
                 if r.status != 200:
@@ -363,23 +366,51 @@ async def _khaya_tts(text: str, lang: str) -> Optional[bytes]:
 
 
 async def text_to_speech(text: str, lang: str) -> Optional[bytes]:
-    # Try lazy-loaded MMS first
+    # 1. Try lazy-loaded MMS first (localhost only)
     mms = _get_mms_tts()
     if mms:
         try:
             loop = asyncio.get_event_loop()
             audio = await loop.run_in_executor(None, mms.synthesize, text, lang)
             if audio:
+                logger.info(f"[TTS] MMS success for {lang}")
                 return audio
         except Exception as e:
             logger.warning(f"[TTS] MMS synthesis failed: {e}")
 
-    # Fallback to Khaya for ALL languages (not just dag)
-    logger.info(f"[TTS] MMS unavailable or failed, trying Khaya AI for {lang}...")
+    # 2. Try GhanaNLP pip client
+    if _nlp:
+        try:
+            loop = asyncio.get_event_loop()
+            audio = None
+            if hasattr(_nlp, "text_to_speech"):
+                audio = await loop.run_in_executor(None, lambda: _nlp.text_to_speech(text, language=lang))
+            elif hasattr(_nlp, "tts"):
+                audio = await loop.run_in_executor(None, lambda: _nlp.tts(text, language=lang))
+            elif hasattr(_nlp, "synthesize"):
+                audio = await loop.run_in_executor(None, lambda: _nlp.synthesize(text, language=lang))
+
+            if audio:
+                if isinstance(audio, bytes):
+                    logger.info(f"[TTS] GhanaNLP pip success for {lang}")
+                    return audio
+                elif isinstance(audio, str):
+                    return base64.b64decode(audio)
+                elif isinstance(audio, dict):
+                    audio_b64 = audio.get("audio") or audio.get("audio_base64") or audio.get("result")
+                    if audio_b64:
+                        return base64.b64decode(audio_b64)
+        except Exception as e:
+            logger.warning(f"[TTS] GhanaNLP pip TTS failed: {e}")
+
+    # 3. Fallback to Khaya REST
+    logger.info(f"[TTS] Trying Khaya REST for {lang}...")
     audio = await _khaya_tts(text, lang)
     if audio:
+        logger.info(f"[TTS] Khaya REST success for {lang}")
         return audio
 
+    logger.error(f"[TTS] ALL TTS failed for {lang}")
     return None
 
 

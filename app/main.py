@@ -1,4 +1,4 @@
-# app/main.py
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,17 +9,25 @@ from app.api.dashboard import router as dashboard_router
 from app.api.chat import router as chat_router
 from app.api.admin import router as admin_router
 
-from app.services.mms_tts_service import mms_tts
-from app.services.mms_stt_service import mms_stt
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Preload Meta MMS models on startup."""
-    # TTS: Twi (aka) and English (eng) only — Dagbani has no MMS model
-    mms_tts.preload(["en", "tw"])
-    # STT: Twi (aka) and English (eng) only — Dagbani has no MMS adapter
-    mms_stt.preload(["en", "tw"])
+    """Preload Meta MMS models on startup. Safely skips on Render."""
+    try:
+        from app.services.mms_tts_service import mms_tts
+        from app.services.mms_stt_service import mms_stt
+
+        # TTS: Twi (aka) and English (eng) only — Dagbani has no MMS model
+        mms_tts.preload(["en", "tw"])
+        # STT: Twi (aka) and English (eng) only — Dagbani has no MMS adapter
+        mms_stt.preload(["en", "tw"])
+        logger.info("[Startup] MMS models preloaded")
+    except Exception as e:
+        # Render (no torch) or any other issue — app still starts
+        logger.warning(f"[Startup] MMS preload skipped: {e}")
+
     yield
 
 
