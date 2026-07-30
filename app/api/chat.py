@@ -72,10 +72,12 @@ if GHANA_NLP_API_KEY:
     try:
         from ghana_nlp import GhanaNLP
         _nlp = GhanaNLP(api_key=GHANA_NLP_API_KEY)
-        logger.info("[Translation] GhanaNLP pip client initialized")
+        logger.info("[Translation] GhanaNLP pip client initialized OK")
     except Exception as e:
         logger.warning(f"[Translation] Failed to init GhanaNLP pip client: {e}")
         _nlp = None
+else:
+    logger.warning("[Translation] GHANA_NLP_API_KEY not set — pip client skipped")
 
 
 # ── AGRICULTURAL TERM NORMALIZATION ──
@@ -141,7 +143,7 @@ async def _translate_pip(text: str, pair: str) -> Optional[str]:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: _nlp.translate(text, language_pair=pair))
 
-        # FIX: ghana-nlp sometimes returns a dict instead of a string
+        # ghana-nlp sometimes returns a dict instead of a string
         if isinstance(result, dict):
             result = (
                 result.get("translation")
@@ -169,8 +171,9 @@ async def _translate_rest(text: str, pair: str) -> Optional[str]:
 
     url = f"{KHAYA_BASE}/v1/translate"
     payload = {"text": text, "source": source, "target": target}
+    # FIX: Azure APIM gateway uses Ocp-Apim-Subscription-Key, NOT Authorization: Bearer
     headers = {
-        "Authorization": f"Bearer {GHANA_NLP_API_KEY}",
+        "Ocp-Apim-Subscription-Key": GHANA_NLP_API_KEY,
         "Content-Type": "application/json",
     }
 
@@ -571,7 +574,6 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
     try:
         english_input = await translate_to_english(request.message, lang)
-        # FIX: safe string conversion for logging
         logger.info(f"[Chat] lang={lang} translated_input_preview={str(english_input)[:80]!r}")
 
         session = None
